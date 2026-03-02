@@ -96,7 +96,7 @@ const COMORBIDITIES = [
 const td = () => new Date().toISOString().split("T")[0];
 const fmt = d => d ? new Date(d+"T00:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"}) : "";
 const ds = d => d ? Math.max(0, Math.floor((new Date()-new Date(d+"T00:00:00"))/864e5)) : 0;
-const uid = () => Math.random().toString(36).substr(2, 9);
+const uid = () => crypto.randomUUID();
 
 // ═══════════════════════════════════════════════════════════
 // DATABASE HELPERS — read/write directly to Supabase
