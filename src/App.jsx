@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
+import { supabase } from "./supabaseClient";
 
 // Bug Watch infection_syndrome categories
 const SYNDROMES = [
@@ -95,29 +96,236 @@ const COMORBIDITIES = [
 const td = () => new Date().toISOString().split("T")[0];
 const fmt = d => d ? new Date(d+"T00:00:00").toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"}) : "";
 const ds = d => d ? Math.max(0, Math.floor((new Date()-new Date(d+"T00:00:00"))/864e5)) : 0;
-const id = () => Math.random().toString(36).substr(2, 9);
+const uid = () => Math.random().toString(36).substr(2, 9);
+
+// ═══════════════════════════════════════════════════════════
+// DATABASE HELPERS — read/write directly to Supabase
+// ═══════════════════════════════════════════════════════════
+
+// Load all episodes for a user, each enriched with visits, medicines, dailyLogs, adhLogs
+async function loadAllEpisodes(userId) {
+  const { data: rows, error } = await supabase
+    .from("episodes").select("*").eq("user_id", userId).order("start_date", { ascending: false });
+  if (error) { console.error("loadEpisodes", error); return []; }
+
+  const enriched = await Promise.all(rows.map(async (r) => {
+    const [{ data: visits }, { data: meds }, { data: logs }] = await Promise.all([
+      supabase.from("healthcare_visits").select("*").eq("episode_id", r.id).order("visit_date"),
+      supabase.from("medicines").select("*").eq("episode_id", r.id),
+      supabase.from("daily_logs").select("*").eq("episode_id", r.id).order("log_date"),
+    ]);
+
+    // For each medicine, load adherence logs
+    const medsWithAdh = await Promise.all((meds || []).map(async (m) => {
+      const { data: adh } = await supabase.from("adherence_logs").select("*").eq("medicine_id", m.id).order("log_date");
+      return dbMedToLocal(m, adh || []);
+    }));
+
+    return dbEpToLocal(r, visits || [], medsWithAdh, logs || []);
+  }));
+
+  return enriched;
+}
+
+// Convert DB episode row → local episode shape
+function dbEpToLocal(r, visits, medicines, dailyLogs) {
+  return {
+    id: r.id, startDate: r.start_date, endDate: r.end_date, status: r.status,
+    syndrome: r.syndrome_id ? { id: r.syndrome_id, label: r.syndrome_label, icon: r.syndrome_icon } : null,
+    symptoms: r.symptoms || [], severity: r.severity_value ? { value: r.severity_value, label: r.severity_label, color: SEVERITY.find(s=>s.value===r.severity_value)?.color || "#999" } : null,
+    notes: r.notes, lastCheckIn: r.last_check_in,
+    healthcareVisits: visits.map(v => ({ id: v.id, type: v.visit_type, date: v.visit_date, outcome: v.outcome, prescribedAb: v.prescribed_ab, adviceSelfCare: v.advice_self_care, notes: v.notes })),
+    medicines, dailyLogs: dailyLogs.map(l => ({ id: l.id, date: l.log_date, feeling: l.feeling, gone: l.resolved_symptoms, added: l.new_symptoms, severity: l.severity_value ? { value: l.severity_value, label: l.severity_label } : null })),
+  };
+}
+
+// Convert DB medicine row → local medicine shape
+function dbMedToLocal(m, adhLogs) {
+  return {
+    id: m.id, drugName: m.drug_name, customName: m.custom_drug_name,
+    isAb: m.is_antibiotic, source: m.source,
+    daysFromOnset: m.days_from_onset, prescDays: m.presc_duration_days ? String(m.presc_duration_days) : "",
+    takenDays: m.taken_duration_days, delayed: m.delayed_prescription,
+    completed: m.course_completed, notCompletedReason: m.not_completed_reason,
+    startDate: m.start_date, adhStatus: m.adherence_status || "na",
+    photoData: m.photo_path, // simplified — photo_path stores reference
+    adhLogs: adhLogs.map(a => ({ date: a.log_date, taken: a.taken, note: a.note, reason: a.stop_reason })),
+  };
+}
+
+async function loadProfile(userId) {
+  const { data, error } = await supabase.from("profiles").select("*").eq("id", userId).single();
+  if (error && error.code !== "PGRST116") console.error("loadProfile", error);
+  if (!data) return null;
+  return {
+    sex: data.sex, ageGroup: data.age_group, region: data.region, isHCW: data.is_hcw,
+    hhSize: data.household_size ? String(data.household_size) : "",
+    hhChildren: data.household_children ? String(data.household_children) : "",
+    conditions: data.long_term_conditions || [],
+    smoking: data.smoking, pregnant: data.pregnant, recurrentUTI: data.recurrent_uti,
+    lastGP: data.last_gp_visit, lastAb: data.last_antibiotic_use, lastMalaria: data.last_malaria_illness,
+  };
+}
 
 // ═══════════════════ MAIN APP ═══════════════════
-export default function App() {
+export default function App({ userId }) {
   const [scr, setScr] = useState("home");
   const [stack, setStack] = useState([]);
   const [eps, setEps] = useState([]);
   const [prof, setProf] = useState(null);
   const [cur, setCur] = useState(null);
   const [step, setStep] = useState(0);
-  const [medTarget, setMedTarget] = useState(null); // for adherence targeting
+  const [medTarget, setMedTarget] = useState(null);
+  const [loading, setLoading] = useState(true);
 
   const nav = s => { setStack(p => [...p, scr]); setScr(s); };
   const back = () => { const p = [...stack]; setScr(p.pop() || "home"); setStack(p); };
   const home = () => { setScr("home"); setStack([]); };
 
-  const saveEp = ep => {
+  // ── Load all data on mount ──
+  const reload = useCallback(async () => {
+    setLoading(true);
+    const [episodes, profile] = await Promise.all([loadAllEpisodes(userId), loadProfile(userId)]);
+    setEps(episodes);
+    setProf(profile);
+    setLoading(false);
+  }, [userId]);
+
+  useEffect(() => { reload(); }, [reload]);
+
+  // ── Save episode (create or update in DB, then reload) ──
+  const saveEp = async (ep) => {
+    setCur(ep); // optimistic UI update
     setEps(p => { const i = p.findIndex(e => e.id === ep.id); if (i >= 0) { const n = [...p]; n[i] = ep; return n; } return [...p, ep]; });
-    setCur(ep);
+
+    // Check if episode already exists in DB
+    const { data: existing } = await supabase.from("episodes").select("id").eq("id", ep.id).single();
+
+    if (existing) {
+      // Update
+      await supabase.from("episodes").update({
+        syndrome_id: ep.syndrome?.id, syndrome_label: ep.syndrome?.label, syndrome_icon: ep.syndrome?.icon,
+        start_date: ep.startDate, end_date: ep.endDate, status: ep.status,
+        symptoms: ep.symptoms, severity_value: ep.severity?.value, severity_label: ep.severity?.label,
+        notes: ep.notes, last_check_in: ep.lastCheckIn || td(),
+      }).eq("id", ep.id);
+    } else {
+      // Insert new
+      const { data: newRow, error } = await supabase.from("episodes").insert({
+        id: ep.id, user_id: userId,
+        syndrome_id: ep.syndrome?.id, syndrome_label: ep.syndrome?.label, syndrome_icon: ep.syndrome?.icon,
+        start_date: ep.startDate, status: "active",
+        symptoms: ep.symptoms, severity_value: ep.severity?.value, severity_label: ep.severity?.label,
+        notes: ep.notes, last_check_in: ep.startDate,
+      }).select().single();
+      if (error) console.error("createEpisode", error);
+      if (newRow) ep.id = newRow.id; // use DB-generated id
+    }
+  };
+
+  // ── Save healthcare visit ──
+  const saveVisit = async (ep, visit) => {
+    const { data, error } = await supabase.from("healthcare_visits").insert({
+      episode_id: ep.id, user_id: userId,
+      visit_type: visit.type, visit_date: visit.date,
+      outcome: visit.outcome, prescribed_ab: visit.prescribedAb,
+      advice_self_care: visit.adviceSelfCare, notes: visit.notes,
+    }).select().single();
+    if (error) console.error("saveVisit", error);
+    const newVisit = data ? { id: data.id, type: data.visit_type, date: data.visit_date, outcome: data.outcome, prescribedAb: data.prescribed_ab, adviceSelfCare: data.advice_self_care, notes: data.notes } : { ...visit, id: uid() };
+    const updated = { ...ep, healthcareVisits: [...ep.healthcareVisits, newVisit] };
+    setEps(p => p.map(e => e.id === ep.id ? updated : e));
+    setCur(updated);
+    return updated;
+  };
+
+  // ── Save medicine ──
+  const saveMedicine = async (ep, med) => {
+    const { data, error } = await supabase.from("medicines").insert({
+      episode_id: ep.id, user_id: userId,
+      drug_name: med.drugName, custom_drug_name: med.customName || null,
+      is_antibiotic: med.isAb, source: med.source || null,
+      days_from_onset: med.daysFromOnset || 0,
+      presc_duration_days: med.prescDays ? parseInt(med.prescDays) : null,
+      delayed_prescription: med.delayed,
+      course_completed: med.completed, not_completed_reason: med.notCompletedReason || null,
+      start_date: med.startDate, adherence_status: med.isAb ? "taking" : "na",
+    }).select().single();
+    if (error) console.error("saveMedicine", error);
+    const newMed = data ? dbMedToLocal(data, []) : { ...med, id: uid() };
+    const updated = { ...ep, medicines: [...ep.medicines, newMed] };
+    setEps(p => p.map(e => e.id === ep.id ? updated : e));
+    setCur(updated);
+    return updated;
+  };
+
+  // ── Save daily check-in ──
+  const saveCheckin = async (ep, log, updatedEp) => {
+    await supabase.from("daily_logs").insert({
+      episode_id: ep.id, user_id: userId, log_date: log.date,
+      feeling: log.feeling, resolved_symptoms: log.gone || [],
+      new_symptoms: log.added || [], severity_value: log.severity?.value, severity_label: log.severity?.label,
+    });
+    // Update the episode in DB
+    await supabase.from("episodes").update({
+      symptoms: updatedEp.symptoms, severity_value: updatedEp.severity?.value,
+      severity_label: updatedEp.severity?.label, status: updatedEp.status,
+      end_date: updatedEp.endDate, last_check_in: td(),
+    }).eq("id", ep.id);
+    // If resolved, update any active meds
+    if (updatedEp.status === "resolved") {
+      await supabase.from("medicines").update({ adherence_status: "completed_recovery" })
+        .eq("episode_id", ep.id).eq("adherence_status", "taking");
+    }
+    setEps(p => p.map(e => e.id === ep.id ? updatedEp : e));
+    setCur(updatedEp);
+  };
+
+  // ── Save adherence logs ──
+  const saveAdherence = async (ep, updatedEp, medLogs) => {
+    // medLogs = { medId: { taken, note, reason } }
+    for (const [medId, log] of Object.entries(medLogs)) {
+      if (!log.taken) continue;
+      await supabase.from("adherence_logs").insert({
+        medicine_id: medId, user_id: userId, log_date: td(),
+        taken: log.taken, note: log.note || null, stop_reason: log.reason || null,
+      });
+      // Update medicine status if stopped or completed
+      const updates = {};
+      if (log.taken === "stopped") {
+        updates.adherence_status = "stopped_early";
+        updates.not_completed_reason = log.reason || null;
+        updates.taken_duration_days = ds(updatedEp.medicines.find(m=>m.id===medId)?.startDate);
+      }
+      if (log.taken === "completed") {
+        updates.adherence_status = "completed";
+        updates.taken_duration_days = ds(updatedEp.medicines.find(m=>m.id===medId)?.startDate) + 1;
+      }
+      if (Object.keys(updates).length > 0) {
+        await supabase.from("medicines").update(updates).eq("id", medId);
+      }
+    }
+    setEps(p => p.map(e => e.id === ep.id ? updatedEp : e));
+    setCur(updatedEp);
+  };
+
+  // ── Save profile ──
+  const saveProfile = async (p) => {
+    const row = {
+      id: userId, sex: p.sex, age_group: p.ageGroup, region: p.region, is_hcw: p.isHCW,
+      household_size: p.hhSize ? parseInt(p.hhSize) : null,
+      household_children: p.hhChildren ? parseInt(p.hhChildren) : null,
+      long_term_conditions: p.conditions, smoking: p.smoking, pregnant: p.pregnant,
+      recurrent_uti: p.recurrentUTI, last_gp_visit: p.lastGP,
+      last_antibiotic_use: p.lastAb, last_malaria_illness: p.lastMalaria,
+    };
+    const { error } = await supabase.from("profiles").upsert(row);
+    if (error) console.error("saveProfile", error);
+    setProf(p);
   };
 
   const newEp = () => {
-    setCur({ id: id(), startDate: td(), status: "active", syndrome: null, symptoms: [], severity: null, dailyLogs: [], healthcareVisits: [], medicines: [], notes: "", lastCheckIn: td() });
+    setCur({ id: uid(), startDate: td(), status: "active", syndrome: null, symptoms: [], severity: null, dailyLogs: [], healthcareVisits: [], medicines: [], notes: "", lastCheckIn: td() });
     setStep(0); nav("report");
   };
 
@@ -148,19 +356,21 @@ export default function App() {
     if (n.type === "adherence") { setMedTarget(n.medId); nav("adherence"); }
   };
 
+  if (loading) return <div style={{...Z.frame,alignItems:"center",justifyContent:"center"}}><p style={{color:"#999",fontSize:14}}>Loading…</p></div>;
+
   return (
     <div style={Z.frame}>
       <div style={Z.status}><span style={{fontSize:11,fontWeight:600}}>9:41</span><span style={{fontSize:11}}>●●● ▐█</span></div>
       <div style={Z.body}>
         {scr==="home" && <Home {...{eps,notifs,prof,newEp,nav,setCur,onNotif}} />}
-        {scr==="report" && <Report ep={cur} step={step} setStep={setStep} upd={setCur} save={ep=>{saveEp(ep);home();}} back={back} />}
-        {scr==="detail" && <Detail ep={cur} upd={saveEp} back={back} nav={nav} />}
-        {scr==="checkin" && <Checkin ep={cur} save={ep=>{saveEp(ep);home();}} back={back} />}
-        {scr==="adherence" && <Adherence ep={cur} medTarget={medTarget} save={ep=>{saveEp(ep);home();}} back={back} />}
-        {scr==="addvisit" && <AddVisit ep={cur} save={ep=>{saveEp(ep);back();}} back={back} />}
-        {scr==="addmed" && <AddMed ep={cur} save={ep=>{saveEp(ep);back();}} back={back} />}
+        {scr==="report" && <Report ep={cur} step={step} setStep={setStep} upd={setCur} save={async ep=>{await saveEp(ep);home();}} back={back} />}
+        {scr==="detail" && <Detail ep={cur} upd={async ep=>{await saveEp(ep);}} back={back} nav={nav} />}
+        {scr==="checkin" && <CheckinScr ep={cur} onSave={saveCheckin} back={back} goHome={home} />}
+        {scr==="adherence" && <AdherenceScr ep={cur} medTarget={medTarget} onSave={saveAdherence} back={back} goHome={home} />}
+        {scr==="addvisit" && <AddVisitScr ep={cur} onSave={saveVisit} back={back} />}
+        {scr==="addmed" && <AddMedScr ep={cur} onSave={saveMedicine} back={back} />}
         {scr==="history" && <History eps={eps} open={ep=>{setCur({...ep});nav("detail");}} back={back} />}
-        {scr==="profile" && <ProfileScr prof={prof} save={p=>{setProf(p);home();}} back={back} />}
+        {scr==="profile" && <ProfileScr prof={prof} save={async p=>{await saveProfile(p);home();}} back={back} />}
       </div>
       <div style={Z.nav}>
         <NB i="🏠" l="Home" on={scr==="home"} t={home} />
@@ -181,7 +391,6 @@ function NB({i,l,on,t,accent}) {
 // ═══════════════════ HOME ═══════════════════
 function Home({eps,notifs,prof,newEp,nav,setCur,onNotif}) {
   const act = eps.filter(e=>e.status==="active");
-  const abCount = act.reduce((s,e)=>s+e.medicines.filter(m=>m.isAb&&m.adhStatus==="taking").length,0);
   return <div style={Z.scroll}>
     <div style={{padding:"12px 20px 14px"}}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
@@ -259,20 +468,25 @@ function Report({ep,step,setStep,upd,save,back}) {
 }
 
 // ═══════════════════ DAILY CHECK-IN ═══════════════════
-function Checkin({ep,save,back}) {
+function CheckinScr({ep,onSave,back,goHome}) {
   const [feel,setFeel] = useState(null);
   const [gone,setGone] = useState([]);
   const [added,setAdded] = useState([]);
   const [sev,setSev] = useState(ep.severity);
   const [st,setSt] = useState(0);
+  const [saving,setSaving] = useState(false);
 
-  const finish = () => {
-    const log = {id:id(),date:td(),feeling:feel,gone,added,severity:sev};
+  const finish = async () => {
+    setSaving(true);
+    const log = {id:uid(),date:td(),feeling:feel,gone,added,severity:sev};
     const syms = [...ep.symptoms.filter(s=>!gone.includes(s)),...added];
-    save({...ep, symptoms:syms, severity:sev, dailyLogs:[...ep.dailyLogs,log], lastCheckIn:td(),
+    const updatedEp = {...ep, symptoms:syms, severity:sev, dailyLogs:[...ep.dailyLogs,log], lastCheckIn:td(),
       status:feel==="resolved"?"resolved":"active", endDate:feel==="resolved"?td():ep.endDate,
       medicines:ep.medicines.map(m=> feel==="resolved"&&m.isAb&&m.adhStatus==="taking"?{...m,adhStatus:"completed_recovery"}:m),
-    });
+    };
+    await onSave(ep, log, updatedEp);
+    setSaving(false);
+    goHome();
   };
 
   return <div style={Z.scroll}>
@@ -310,19 +524,21 @@ function Checkin({ep,save,back}) {
             <div style={{width:14,height:14,borderRadius:7,background:sv.color,flexShrink:0}}/><span style={{fontWeight:600,fontSize:14}}>{sv.label}</span>
           </button>
         )}</div>
-        <Pr tap={finish} mt={16}>{feel==="resolved"?"Mark recovered ✓":"Save check-in ✓"}</Pr>
+        <Pr tap={finish} mt={16} disabled={saving}>{saving?"Saving…":feel==="resolved"?"Mark recovered ✓":"Save check-in ✓"}</Pr>
       </>}
     </div>
   </div>;
 }
 
 // ═══════════════════ ADHERENCE LOG ═══════════════════
-function Adherence({ep,medTarget,save,back}) {
+function AdherenceScr({ep,medTarget,onSave,back,goHome}) {
   const meds = ep.medicines.filter(m=>m.isAb&&m.adhStatus==="taking");
   const [logs,setLogs] = useState({});
+  const [saving,setSaving] = useState(false);
 
-  const finish = () => {
-    save({...ep, medicines:ep.medicines.map(m=>{
+  const finish = async () => {
+    setSaving(true);
+    const updatedEp = {...ep, medicines:ep.medicines.map(m=>{
       const log = logs[m.id]; if (!log) return m;
       const entry = {date:td(),taken:log.taken,note:log.note||"",reason:log.reason||""};
       let status = m.adhStatus;
@@ -332,7 +548,10 @@ function Adherence({ep,medTarget,save,back}) {
         ...(log.taken==="stopped"?{notCompletedReason:log.reason,takenDays:ds(m.startDate)}:{}),
         ...(log.taken==="completed"?{takenDays:ds(m.startDate)+1}:{}),
       };
-    })});
+    })};
+    await onSave(ep, updatedEp, logs);
+    setSaving(false);
+    goHome();
   };
 
   return <div style={Z.scroll}>
@@ -365,7 +584,7 @@ function Adherence({ep,medTarget,save,back}) {
           </div>}
         </div>;
       })}
-      <Pr tap={finish} mt={20}>Save medicine log ✓</Pr>
+      <Pr tap={finish} mt={20} disabled={saving}>{saving?"Saving…":"Save medicine log ✓"}</Pr>
     </div>
   </div>;
 }
@@ -446,8 +665,18 @@ function Detail({ep,upd,back,nav}) {
 }
 
 // ═══════════════════ ADD HEALTHCARE VISIT ═══════════════════
-function AddVisit({ep,save,back}) {
+function AddVisitScr({ep,onSave,back}) {
   const [v,setV] = useState({type:"",date:td(),outcome:"",prescribedAb:false,adviceSelfCare:false,notes:""});
+  const [saving,setSaving] = useState(false);
+
+  const doSave = async () => {
+    if (!v.type) return;
+    setSaving(true);
+    await onSave(ep, v);
+    setSaving(false);
+    back();
+  };
+
   return <div style={Z.scroll}>
     <TB l={<B t="← Back" tap={back}/>} r={<span style={{fontSize:13,fontWeight:600,color:"#2D6A4F"}}>Healthcare visit</span>} />
     <div style={{padding:"0 20px"}}>
@@ -467,20 +696,24 @@ function AddVisit({ep,save,back}) {
       <Tog on={v.adviceSelfCare} tap={()=>setV(p=>({...p,adviceSelfCare:!p.adviceSelfCare}))} l="Self-care / wait-and-see advice given?" mt={12} />
       <Lb mt={12}>Notes</Lb>
       <textarea value={v.notes} onChange={e=>setV(p=>({...p,notes:e.target.value}))} placeholder="Optional" style={{...Z.inp,height:52,resize:"vertical"}} />
-      <Pr tap={()=>{if(v.type)save({...ep,healthcareVisits:[...ep.healthcareVisits,{...v,id:id()}]});}} mt={18} disabled={!v.type}>Save visit ✓</Pr>
+      <Pr tap={doSave} mt={18} disabled={!v.type||saving}>{saving?"Saving…":"Save visit ✓"}</Pr>
     </div>
   </div>;
 }
 
 // ═══════════════════ ADD MEDICINE ═══════════════════
-function AddMed({ep,save,back}) {
+function AddMedScr({ep,onSave,back}) {
   const [m,setM] = useState({drugName:"",customName:"",isAb:false,source:"",daysFromOnset:ds(ep.startDate),prescDays:"",delayed:false,completed:null,notCompletedReason:"",photoData:null,startDate:td(),adhStatus:"na",adhLogs:[]});
   const fr = useRef(null);
+  const [saving,setSaving] = useState(false);
 
-  const doSave = () => {
+  const doSave = async () => {
     if(!m.drugName&&!m.customName) return;
-    const med = {...m,id:id(),adhStatus:m.isAb?"taking":"na",drugName:m.drugName==="__other"?m.customName:m.drugName};
-    save({...ep,medicines:[...ep.medicines,med]});
+    setSaving(true);
+    const med = {...m,adhStatus:m.isAb?"taking":"na",drugName:m.drugName==="__other"?m.customName:m.drugName};
+    await onSave(ep, med);
+    setSaving(false);
+    back();
   };
 
   return <div style={Z.scroll}>
@@ -503,7 +736,7 @@ function AddMed({ep,save,back}) {
       </select>
       {m.drugName==="__other" && <input placeholder="Type medicine name" value={m.customName} onChange={e=>setM(p=>({...p,customName:e.target.value}))} style={{...Z.inp,marginTop:8}} />}
 
-      <Lb mt={14}>Source (Bug Watch: ab_source)</Lb>
+      <Lb mt={14}>Source</Lb>
       <select value={m.source} onChange={e=>setM(p=>({...p,source:e.target.value}))} style={Z.inp}>
         <option value="">Where did you get it?</option>{AB_SOURCES.map(s=><option key={s.v} value={s.v}>{s.l}</option>)}
       </select>
@@ -535,7 +768,7 @@ function AddMed({ep,save,back}) {
         {m.photoData?<img src={m.photoData} alt="Medicine" style={{width:"100%",height:100,objectFit:"cover",borderRadius:8}}/>:<><span style={{fontSize:26}}>📷</span><span style={{fontSize:12,color:"#999"}}>Tap to photograph box or packaging</span></>}
       </button>
 
-      <Pr tap={doSave} mt={18} disabled={!m.drugName&&!m.customName}>{m.isAb?"Save & start adherence tracking ✓":"Save medicine ✓"}</Pr>
+      <Pr tap={doSave} mt={18} disabled={(!m.drugName&&!m.customName)||saving}>{saving?"Saving…":m.isAb?"Save & start adherence tracking ✓":"Save medicine ✓"}</Pr>
       <div style={{height:24}}/>
     </div>
   </div>;
@@ -561,7 +794,11 @@ function History({eps,open,back}) {
 // ═══════════════════ PROFILE ═══════════════════
 function ProfileScr({prof,save,back}) {
   const [p,setP] = useState(prof||{sex:"",ageGroup:"",region:"",isHCW:false,hhSize:"",hhChildren:"",conditions:[],smoking:"",pregnant:"",recurrentUTI:false,lastGP:"",lastAb:"",lastMalaria:""});
+  const [saving,setSaving] = useState(false);
   const togC = c => setP(pr=>({...pr,conditions:pr.conditions.includes(c)?pr.conditions.filter(x=>x!==c):[...pr.conditions,c]}));
+
+  const doSave = async () => { setSaving(true); await save(p); setSaving(false); };
+
   return <div style={Z.scroll}>
     <TB l={<B t="← Back" tap={back}/>} r={<span style={{fontSize:13,fontWeight:600,color:"#2D6A4F"}}>Profile</span>} />
     <div style={{padding:"0 20px"}}>
@@ -597,7 +834,7 @@ function ProfileScr({prof,save,back}) {
           <option value="">Select…</option>{["Within last month","Within last 3 months","Within last year","More than a year ago","Never","Can't remember"].map(o=><option key={o} value={o}>{o}</option>)}
         </select></div>
       )}
-      <Pr tap={()=>save(p)} mt={24}>Save profile ✓</Pr>
+      <Pr tap={doSave} mt={24} disabled={saving}>{saving?"Saving…":"Save profile ✓"}</Pr>
       <div style={{height:28}}/>
     </div>
   </div>;
